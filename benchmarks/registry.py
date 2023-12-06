@@ -4,6 +4,7 @@ from PIL import PngImagePlugin
 LARGE_ENOUGH_NUMBER = 100
 PngImagePlugin.MAX_TEXT_CHUNK = LARGE_ENOUGH_NUMBER * (1024**2)
 import os, sys
+import models as ctkd_models
 import engine.models as models
 import engine.utils as utils
 from functools import partial
@@ -97,10 +98,15 @@ GRAPH_MODEL_DICT = {
     'dgcnn': models.graph.dgcnn,
 }
 
-def get_model(name: str, num_classes, pretrained=False, target_dataset='cifar', **kwargs):
+def get_model(name: str, num_classes, pretrained=False, target_dataset='cifar', use_ctkd_models = False, **kwargs):
+    if use_ctkd_models:
+        model = ctkd_models.model_dict[name](num_classes=num_classes)
+        return model
+
     if target_dataset == "imagenet":
+        weights = "IMAGENET1K_V1" if pretrained else None
         
-        model = IMAGENET_MODEL_DICT[name](pretrained=pretrained)
+        model = IMAGENET_MODEL_DICT[name](weights=weights)
     elif 'cifar' in target_dataset:
         model = MODEL_DICT[name](num_classes=num_classes)
     elif target_dataset == 'modelnet40':

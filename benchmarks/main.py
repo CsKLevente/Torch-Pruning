@@ -1,4 +1,5 @@
 import sys, os
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 from functools import partial
@@ -11,12 +12,15 @@ import torch.nn.functional as F
 import torch_pruning as tp
 import engine.utils as utils
 import registry
+import numpy as np
 
 parser = argparse.ArgumentParser()
 
 # Basic options
-parser.add_argument("--mode", type=str, required=True, choices=["pretrain", "prune", "test"])
+parser.add_argument("--mode", type=str, required=True, choices=["pretrain", "prune", "test", "measure",
+                                                                "search_fastest"])
 parser.add_argument("--model", type=str, required=True)
+parser.add_argument("--use_ctkd_models", action='store_true', default=False)
 parser.add_argument("--verbose", action="store_true", default=False)
 parser.add_argument("--dataset", type=str, default="cifar100", choices=['cifar10', 'cifar100', 'modelnet40'])
 parser.add_argument("--batch-size", type=int, default=128)
@@ -44,7 +48,11 @@ parser.add_argument("--sl-reg-warmup", type=int, default=0, help="epochs for spa
 parser.add_argument("--sl-restore", type=str, default=None)
 parser.add_argument("--iterative-steps", default=400, type=int)
 
+parser.add_argument("--repetitions", default=10, type=int, help="repetitions for inference time measurement")
+parser.add_argument("--max-batch", type=int, default=None, help="maximal batch size in search_fastest mode")
+
 args = parser.parse_args()
+
 
 def progressive_pruning(pruner, model, speed_up, example_inputs):
     model.eval()
@@ -54,8 +62,9 @@ def progressive_pruning(pruner, model, speed_up, example_inputs):
         pruner.step(interactive=False)
         pruned_ops, _ = tp.utils.count_ops_and_params(model, example_inputs=example_inputs)
         current_speed_up = float(base_ops) / pruned_ops
-        #print(current_speed_up)
+        # print(current_speed_up)
     return current_speed_up
+
 
 def eval(model, test_loader, device=None):
     correct = 0
@@ -74,6 +83,66 @@ def eval(model, test_loader, device=None):
             correct += (pred == target).sum()
             total += len(target)
     return (correct / total).item(), (loss / total).item()
+
+
+def infer(model, test_loader, device=None, repetitions=10):
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+
+    # INIT LOGGERS
+    starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    timings = np.zeros((repetitions, 1))
+
+    # INFERENCE ONLY
+    with torch.no_grad():
+        # GPU-WARM-UP
+        for data, target in test_loader:
+            data = data.to(device)
+            _ = model(data)
+        # MEASURE PERFORMANCE
+        for rep in range(repetitions):
+            starter.record()
+            for data, target in test_loader:
+                data = data.to(device)
+                _ = model(data)
+            ender.record()
+            # WAIT FOR GPU SYNC
+            torch.cuda.synchronize()
+            curr_time = starter.elapsed_time(ender)
+            timings[rep] = curr_time
+    return timings
+
+
+def infer_dummy(model, test_loader, device=None, repetitions=10):
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+    data, target = next(iter(test_loader))
+    data = data.to(device)
+
+    # INIT LOGGERS
+    starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    timings = np.zeros((repetitions,1))
+
+    # INFERENCE ONLY
+    with torch.no_grad():
+        # GPU-WARM-UP
+        for _ in range(10):
+            _ = model(data)
+        # MEASURE PERFORMANCE
+        for rep in range(repetitions):
+            starter.record()
+            _ = model(data)
+            ender.record()
+            # WAIT FOR GPU SYNC
+            torch.cuda.synchronize()
+            curr_time = starter.elapsed_time(ender)
+            timings[rep] = curr_time
+    return timings
+
 
 def train_model(
     model,
@@ -114,7 +183,7 @@ def train_model(
             loss = F.cross_entropy(out, target)
             loss.backward()
             if pruner is not None:
-                pruner.regularize(model) # for sparsity learning
+                pruner.regularize(model)  # for sparsity learning
             optimizer.step()
             if i % 10 == 0 and args.verbose:
                 args.logger.info(
@@ -127,7 +196,7 @@ def train_model(
                         optimizer.param_groups[0]["lr"],
                     )
                 )
-        
+
         model.eval()
         acc, val_loss = eval(model, test_loader, device=device)
         args.logger.info(
@@ -139,7 +208,8 @@ def train_model(
             os.makedirs(args.output_dir, exist_ok=True)
             if args.mode == "prune":
                 if save_as is None:
-                    save_as = os.path.join( args.output_dir, "{}_{}_{}.pth".format(args.dataset, args.model, args.method) )
+                    save_as = os.path.join(args.output_dir,
+                                           "{}_{}_{}.pth".format(args.dataset, args.model, args.method))
 
                 if save_state_dict_only:
                     torch.save(model.state_dict(), save_as)
@@ -147,7 +217,7 @@ def train_model(
                     torch.save(model, save_as)
             elif args.mode == "pretrain":
                 if save_as is None:
-                    save_as = os.path.join( args.output_dir, "{}_{}.pth".format(args.dataset, args.model) )
+                    save_as = os.path.join(args.output_dir, "{}_{}.pth".format(args.dataset, args.model))
                 torch.save(model.state_dict(), save_as)
             best_acc = acc
         scheduler.step()
@@ -178,8 +248,8 @@ def get_pruner(model, example_inputs):
         pruner_entry = partial(tp.pruner.GroupNormPruner, reg=args.reg, global_pruning=args.global_pruning)
     else:
         raise NotImplementedError
-    
-    #args.is_accum_importance = is_accum_importance
+
+    # args.is_accum_importance = is_accum_importance
     unwrapped_parameters = []
     ignored_layers = []
     ch_sparsity_dict = {}
@@ -189,7 +259,7 @@ def get_pruner(model, example_inputs):
             ignored_layers.append(m)
         elif isinstance(m, torch.nn.modules.conv._ConvNd) and m.out_channels == args.num_classes:
             ignored_layers.append(m)
-    
+
     # Here we fix iterative_steps=200 to prune the model progressively with small steps 
     # until the required speed up is achieved.
     pruner = pruner_entry(
@@ -220,8 +290,10 @@ def main():
         args.output_dir = os.path.join(args.output_dir, args.dataset, args.mode)
         logger_name = "{}-{}".format(args.dataset, args.model)
         log_file = "{}/{}.txt".format(args.output_dir, logger_name)
-    elif args.mode == "test":
-        log_file = None
+    elif args.mode in ["test", "measure", "search_fastest"]:
+        logger_name = "{}-{}-{}-{}".format(args.dataset, args.model, os.path.basename(args.restore), args.mode)
+        args.output_dir = os.path.join(args.output_dir, args.dataset, args.mode, logger_name)
+        log_file = "{}/{}.txt".format(args.output_dir, logger_name)
     args.logger = utils.get_logger(logger_name, output=log_file)
 
     # Model & Dataset
@@ -230,7 +302,8 @@ def main():
         args.dataset, data_root="data"
     )
     args.num_classes = num_classes
-    model = registry.get_model(args.model, num_classes=num_classes, pretrained=True, target_dataset=args.dataset)
+    model = registry.get_model(args.model, num_classes=num_classes, pretrained=True, target_dataset=args.dataset,
+                               use_ctkd_models=args.use_ctkd_models)
     train_loader = torch.utils.data.DataLoader(
         train_dst,
         batch_size=args.batch_size,
@@ -241,7 +314,7 @@ def main():
     test_loader = torch.utils.data.DataLoader(
         val_dst, batch_size=args.batch_size, num_workers=4
     )
-    
+
     for k, v in utils.utils.flatten_dict(vars(args)).items():  # print args
         args.logger.info("%s: %s" % (k, v))
 
@@ -253,7 +326,6 @@ def main():
             model.load_state_dict(loaded)
         args.logger.info("Loading model from {restore}".format(restore=args.restore))
     model = model.to(args.device)
-
 
     ######################################################
     # Training / Pruning / Testing
@@ -277,7 +349,7 @@ def main():
         # 0. Sparsity Learning
         if args.sparsity_learning:
             reg_pth = "reg_{}_{}_{}_{}.pth".format(args.dataset, args.model, args.method, args.reg)
-            reg_pth = os.path.join( os.path.join(args.output_dir, reg_pth) )
+            reg_pth = os.path.join(os.path.join('run/cifar10/prune/cifar10-global-group_sl-resnet56', reg_pth))    # args.output_dir
             if not args.sl_restore:
                 args.logger.info("Regularizing...")
                 train_model(
@@ -290,22 +362,22 @@ def main():
                     lr_decay_gamma=args.lr_decay_gamma,
                     pruner=pruner,
                     save_state_dict_only=True,
-                    save_as = reg_pth,
+                    save_as=reg_pth,
                 )
             args.logger.info("Loading the sparse model from {}...".format(reg_pth))
-            model.load_state_dict( torch.load( reg_pth, map_location=args.device) )
-        
+            model.load_state_dict(torch.load(reg_pth, map_location=args.device))
+
         # 1. Pruning
         model.eval()
         ori_ops, ori_size = tp.utils.count_ops_and_params(model, example_inputs=example_inputs)
         ori_acc, ori_val_loss = eval(model, test_loader, device=args.device)
         args.logger.info("Pruning...")
         progressive_pruning(pruner, model, speed_up=args.speed_up, example_inputs=example_inputs)
-        del pruner # remove reference
+        del pruner  # remove reference
         args.logger.info(model)
         pruned_ops, pruned_size = tp.utils.count_ops_and_params(model, example_inputs=example_inputs)
         pruned_acc, pruned_val_loss = eval(model, test_loader, device=args.device)
-        
+
         args.logger.info(
             "Params: {:.2f} M => {:.2f} M ({:.2f}%)".format(
                 ori_size / 1e6, pruned_size / 1e6, pruned_size / ori_size * 100
@@ -323,7 +395,7 @@ def main():
         args.logger.info(
             "Val Loss: {:.4f} => {:.4f}".format(ori_val_loss, pruned_val_loss)
         )
-        
+
         # 2. Finetuning
         args.logger.info("Finetuning...")
         train_model(
@@ -345,6 +417,48 @@ def main():
         args.logger.info("ops: {:.2f} M".format(ops / 1e6))
         acc, val_loss = eval(model, test_loader)
         args.logger.info("Acc: {:.4f} Val Loss: {:.4f}\n".format(acc, val_loss))
+    elif args.mode == "measure":
+        model.eval()
+        ops, params = tp.utils.count_ops_and_params(
+            model, example_inputs=example_inputs,
+        )
+        args.logger.info("Params: {:.2f} M".format(params / 1e6))
+        args.logger.info("ops: {:.2f} M".format(ops / 1e6))
+        acc, val_loss = eval(model, test_loader)
+        args.logger.info("Acc: {:.4f} Val Loss: {:.4f}\n".format(acc, val_loss))
+        timings = infer(model, test_loader, repetitions=args.repetitions)
+        args.logger.info("Mean inference times: {:.4f} ms std: {:.4f} ms".format(np.mean(timings), np.std(timings)))
+        args.logger.info("Throughput: {:.4f} 1/s\n".format(len(test_loader.dataset)/np.mean(timings)*1000))
+        timings = infer_dummy(model, test_loader, repetitions=args.repetitions)
+        args.logger.info("Mean inference times: {:.4f} ms std: {:.4f} ms".format(np.mean(timings), np.std(timings)))
+        args.logger.info("Throughput: {:.4f} 1/s\n".format(args.batch_size/np.mean(timings)*1000))
+    elif args.mode == "search_fastest":
+        batch_size = args.batch_size
+        max_batch_size = args.max_batch
+
+        fastest_batch = batch_size
+        fastest_time = np.inf
+        fastest_throughput = 0.0
+
+        args.logger.info("Batch_size | Inference Time [ms]")
+        while max_batch_size is None or batch_size <= max_batch_size:
+            batch_loader = torch.utils.data.DataLoader(val_dst, batch_size=batch_size, num_workers=4)
+            try:
+                timings = infer(model, batch_loader, repetitions=args.repetitions)
+                mean_time = np.mean(timings)
+                args.logger.info("{:<12d}| {:>.4f}".format(batch_size, mean_time))
+                # if batch_size/mean_time > fastest_throughput:  # infer_dummy
+                if 10000 / mean_time > fastest_throughput:      # infer
+                    fastest_time = mean_time
+                    fastest_batch = batch_size
+                    # fastest_throughput = batch_size/mean_time  # infer_dummy
+                    fastest_throughput = 10000 / mean_time          # infer
+                batch_size += args.batch_size
+            except torch.cuda.OutOfMemoryError as e:
+                args.logger.info("Batch size {:d} over memory limit. Stop searching.".format(batch_size))
+                max_batch_size = batch_size - args.batch_size
+        args.logger.info("Fastest batch: {:d} | Infer time: {:.4f} ms | Throughput: {:.2f} [1/s]".format(fastest_batch, fastest_time, fastest_throughput*1000))
+
 
 if __name__ == "__main__":
     main()
