@@ -156,6 +156,10 @@ def get_dataset(name: str, data_root: str='data', return_transform=False):
         val_dst = utils.datasets.ModelNet40(data_root=data_root, partition='test', num_points=1024)
         train_transform = val_transform = None
         input_size = (1, 3, 2048)
+    elif name in ['imagenette', 'imagewoof']:
+        num_classes = 10
+        train_dst, val_dst= utils.datasets.get_imagenet_dataloader(dataset=name)
+        input_size = (1, 3, 224, 224)
     else:
         raise NotImplementedError
     if return_transform:

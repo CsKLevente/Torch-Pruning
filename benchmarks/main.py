@@ -12,17 +12,17 @@ import torch.nn.functional as F
 import torch_pruning as tp
 import engine.utils as utils
 import registry
-import numpy as np
+import numpy as npexit
 
 parser = argparse.ArgumentParser()
 
 # Basic options
-parser.add_argument("--mode", type=str, required=True, choices=["pretrain", "prune", "test", "measure",
-                                                                "search_fastest"])
+parser.add_argument("--mode", type=str, required=True, choices=["pretrain", "prune", "prune_sparse", "prune_progressive",
+                                                                "test", "measure", "search_fastest"])
 parser.add_argument("--model", type=str, required=True)
 parser.add_argument("--use_ctkd_models", action='store_true', default=False)
 parser.add_argument("--verbose", action="store_true", default=False)
-parser.add_argument("--dataset", type=str, default="cifar100", choices=['cifar10', 'cifar100', 'modelnet40'])
+parser.add_argument("--dataset", type=str, default="cifar100", choices=['cifar10', 'cifar100', 'modelnet40', 'imagenette', 'imagewoof'])
 parser.add_argument("--batch-size", type=int, default=128)
 parser.add_argument("--total-epochs", type=int, default=100)
 parser.add_argument("--lr-decay-milestones", default="60,80", type=str, help="milestones for learning rate decay")
@@ -48,6 +48,10 @@ parser.add_argument("--sl-reg-warmup", type=int, default=0, help="epochs for spa
 parser.add_argument("--sl-restore", type=str, default=None)
 parser.add_argument("--iterative-steps", default=400, type=int)
 
+parser.add_argument("--sparse-pretrained-model", action="store_true", default=False, help="Ignore sparsity learning step, because the loaded model has already been trained sparsely")
+parser.add_argument("--no-finetuning", action="store_true", default=False, help="Ignore Finetuning step after Pruning")
+
+
 parser.add_argument("--repetitions", default=10, type=int, help="repetitions for inference time measurement")
 parser.add_argument("--max-batch", type=int, default=None, help="maximal batch size in search_fastest mode")
 
@@ -64,6 +68,25 @@ def progressive_pruning(pruner, model, speed_up, example_inputs):
         current_speed_up = float(base_ops) / pruned_ops
         # print(current_speed_up)
     return current_speed_up
+
+
+def prune_all_sparse_groups(pruner, model, example_inputs, test_loader):
+    model.eval()
+    base_ops, _ = tp.utils.count_ops_and_params(model, example_inputs=example_inputs)
+    prev_speedup = 1
+    current_speed_up = 1
+    base_acc, _ = eval(model, test_loader)
+    current_acc = base_acc
+    while current_acc == base_acc:
+        prev_speedup = current_speed_up
+        pruner.step(interactive=False)
+        pruned_ops, _ = tp.utils.count_ops_and_params(model, example_inputs=example_inputs)
+        current_speed_up = float(base_ops) / pruned_ops
+        current_acc, _ = eval(model, test_loader)
+        print(f"Step: {pruner.current_step}/{pruner.iterative_steps}, Acc:{current_acc}, Speed up: {current_speed_up}")
+        print(current_acc, current_speed_up, pruned_ops)
+    print(prev_speedup, current_speed_up, base_acc, current_acc)
+    return prev_speedup
 
 
 def eval(model, test_loader, device=None):
@@ -206,7 +229,7 @@ def train_model(
         )
         if best_acc < acc:
             os.makedirs(args.output_dir, exist_ok=True)
-            if args.mode == "prune":
+            if args.mode in ["prune", "prune_progressive"]:
                 if save_as is None:
                     save_as = os.path.join(args.output_dir,
                                            "{}_{}_{}.pth".format(args.dataset, args.model, args.method))
@@ -215,7 +238,7 @@ def train_model(
                     torch.save(model.state_dict(), save_as)
                 else:
                     torch.save(model, save_as)
-            elif args.mode == "pretrain":
+            elif args.mode == "pretrain" or pruner is None:
                 if save_as is None:
                     save_as = os.path.join(args.output_dir, "{}_{}.pth".format(args.dataset, args.model))
                 torch.save(model.state_dict(), save_as)
@@ -273,6 +296,7 @@ def get_pruner(model, example_inputs):
         ignored_layers=ignored_layers,
         unwrapped_parameters=unwrapped_parameters,
     )
+    # args.logger.info(pruner.calc_group_importances())
     return pruner
 
 
@@ -281,7 +305,7 @@ def main():
         torch.manual_seed(args.seed)
 
     # Logger
-    if args.mode == "prune":
+    if args.mode in ["prune", "prune_progressive", "prune_sparse"]:
         prefix = 'global' if args.global_pruning else 'local'
         logger_name = "{}-{}-{}-{}".format(args.dataset, prefix, args.method, args.model)
         args.output_dir = os.path.join(args.output_dir, args.dataset, args.mode, logger_name)
@@ -344,10 +368,10 @@ def main():
             train_loader=train_loader,
             test_loader=test_loader
         )
-    elif args.mode == "prune":
+    elif args.mode in ["prune", "prune_sparse"]:
         pruner = get_pruner(model, example_inputs=example_inputs)
         # 0. Sparsity Learning
-        if args.sparsity_learning:
+        if args.sparsity_learning and not args.sparse_pretrained_model:
             reg_pth = "reg_{}_{}_{}_{}.pth".format(args.dataset, args.model, args.method, args.reg)
             reg_pth = os.path.join(os.path.join('run/cifar10/prune/cifar10-global-group_sl-resnet56', reg_pth))    # args.output_dir
             if not args.sl_restore:
@@ -372,7 +396,10 @@ def main():
         ori_ops, ori_size = tp.utils.count_ops_and_params(model, example_inputs=example_inputs)
         ori_acc, ori_val_loss = eval(model, test_loader, device=args.device)
         args.logger.info("Pruning...")
-        progressive_pruning(pruner, model, speed_up=args.speed_up, example_inputs=example_inputs)
+        if args.mode == "prune":
+            progressive_pruning(pruner, model, speed_up=args.speed_up, example_inputs=example_inputs)
+        elif args.mode == "prune_sparse":
+            _ = prune_all_sparse_groups(pruner, model, example_inputs, test_loader)
         del pruner  # remove reference
         args.logger.info(model)
         pruned_ops, pruned_size = tp.utils.count_ops_and_params(model, example_inputs=example_inputs)
@@ -395,19 +422,138 @@ def main():
         args.logger.info(
             "Val Loss: {:.4f} => {:.4f}".format(ori_val_loss, pruned_val_loss)
         )
-
+        os.makedirs(args.output_dir, exist_ok=True)
+        save_as = os.path.join(args.output_dir, "{}_{}_{}.pth".format(args.dataset, args.model, args.method))
+        torch.save(model, save_as)
         # 2. Finetuning
-        args.logger.info("Finetuning...")
+        if not args.no_finetuning:
+            args.logger.info("Finetuning...")
+            train_model(
+                model,
+                epochs=args.total_epochs,
+                lr=args.lr,
+                lr_decay_milestones=args.lr_decay_milestones,
+                train_loader=train_loader,
+                test_loader=test_loader,
+                device=args.device,
+                save_state_dict_only=False,
+            )
+    elif args.mode == "prune_progressive":
+        pruner = get_pruner(model, example_inputs=example_inputs)
+        # 0. Initial Training & Sparsity Learning (Longer before first pruning step)
+        reg_pth = "reg_{}_{}_{}_{}.pth".format(args.dataset, args.model, args.method, args.reg)
+        reg_pth = os.path.join(os.path.join(args.output_dir, reg_pth))    # 'run/cifar10/prune/cifar10-global-group_sl-resnet56'
+        args.logger.info("Training & Regularizing...")
         train_model(
             model,
+            train_loader=train_loader,
+            test_loader=test_loader,
             epochs=args.total_epochs,
             lr=args.lr,
             lr_decay_milestones=args.lr_decay_milestones,
-            train_loader=train_loader,
-            test_loader=test_loader,
-            device=args.device,
-            save_state_dict_only=False,
+            lr_decay_gamma=args.lr_decay_gamma,
+            pruner=pruner if args.sparsity_learning else None,
+            save_state_dict_only=True,
+            save_as=reg_pth,
         )
+        args.logger.info("Loading the sparse model from {}...".format(reg_pth))
+        model.load_state_dict(torch.load(reg_pth, map_location=args.device))
+
+        model.eval()
+        ori_ops, ori_size = tp.utils.count_ops_and_params(model, example_inputs=example_inputs)
+        ori_acc, ori_val_loss = eval(model, test_loader, device=args.device)
+
+
+        # Save stats before first pruning step
+        stats = []
+        current_stat = {
+            "accuracy": ori_acc,
+            "value_loss": ori_val_loss,
+            "flops": ori_ops,
+            "speedup": 1.0,
+            "params": ori_size,
+            "target_sparsity": 0.0,
+            "current_sparsity": 0.0,
+            "step": 0,
+            "group_importance": pruner.calc_group_importances(),
+        }
+        stats.append(current_stat)
+        stat_pth = "step_{}_stats.pth".format(0)
+        stat_pth = os.path.join(os.path.join(args.output_dir, stat_pth))
+        current_stat["model"] = model
+        torch.save(current_stat, stat_pth)
+
+        # 1. Progressive Pruning while training
+        # Number of pruning steps done (starts at 1)
+        for step in range(1, args.iterative_steps+1):
+            model.eval()
+            args.logger.info("Pruning step {:d}/{:d}".format(step, args.iterative_steps))
+            pruner.step(interactive=False)
+            model.train()
+            pruner = get_pruner(model, example_inputs=example_inputs)
+
+            reg_pth = "reg_{}_{}_{}_{}.pth".format(args.dataset, args.model, args.method, args.reg)
+            reg_pth = os.path.join(os.path.join(args.output_dir, reg_pth))
+
+            args.logger.info("Regularizing & Recovering...")
+            train_model(
+                model,
+                train_loader=train_loader,
+                test_loader=test_loader,
+                epochs=args.sl_total_epochs,
+                lr=args.sl_lr,
+                lr_decay_milestones=args.sl_lr_decay_milestones,
+                lr_decay_gamma=args.lr_decay_gamma,
+                pruner=pruner if args.sparsity_learning else None,
+                save_state_dict_only=True,
+                save_as=reg_pth,
+            )
+            args.logger.info("Loading the sparse model from {}...".format(reg_pth))
+            model.load_state_dict(torch.load(reg_pth, map_location=args.device))
+
+            # Save stats
+            pruned_ops, pruned_size = tp.utils.count_ops_and_params(model, example_inputs=example_inputs)
+            pruned_acc, pruned_val_loss = eval(model, test_loader, device=args.device)
+            current_stat = {
+                "accuracy": pruned_acc,
+                "value_loss": pruned_val_loss,
+                "flops": pruned_ops,
+                "speedup": ori_ops/pruned_ops,
+                "params": pruned_size,
+                "target_sparsity": (step / float(args.iterative_steps)),    # See pruner/algorithms/scheduler.py
+                "current_sparsity": 1.0 - pruned_size / ori_size,
+                "step": step,
+                "group_importance": pruner.calc_group_importances(),
+            }
+            stats.append(current_stat)
+            stat_pth = "step_{}_stats.pth".format(step)
+            stat_pth = os.path.join(os.path.join(args.output_dir, stat_pth))
+            current_stat["model"] = model
+            torch.save(current_stat, stat_pth)
+
+            # Info log for tracking progress
+            if step % 1 == 0:
+                args.logger.info(
+                    "Params: {:.2f} M => {:.2f} M ({:.2f}%)".format(
+                        ori_size / 1e6, pruned_size / 1e6, pruned_size / ori_size * 100
+                    )
+                )
+                args.logger.info(
+                    "FLOPs: {:.2f} M => {:.2f} M ({:.2f}%, {:.2f}X )".format(
+                        ori_ops / 1e6,
+                        pruned_ops / 1e6,
+                        pruned_ops / ori_ops * 100,
+                        ori_ops / pruned_ops,
+                    )
+                )
+                args.logger.info("Acc: {:.4f} => {:.4f}".format(ori_acc, pruned_acc))
+                args.logger.info(
+                    "Val Loss: {:.4f} => {:.4f}".format(ori_val_loss, pruned_val_loss)
+                )
+                args.logger.info(model)
+        torch.save(stats, os.path.join(os.path.join(args.output_dir, "stats_list.pth")))
+        del pruner  # remove reference
+
     elif args.mode == "test":
         model.eval()
         ops, params = tp.utils.count_ops_and_params(

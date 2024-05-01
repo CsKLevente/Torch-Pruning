@@ -70,13 +70,18 @@ class MetaPruner:
         self.round_to = round_to
 
         # Build dependency graph
+        self.example_inputs = example_inputs
+        self.output_transform = output_transform
+        self.unwrapped_parameters = unwrapped_parameters
+        self.customized_pruners = customized_pruners
         self.DG = dependency.DependencyGraph().build_dependency(
-            model,
-            example_inputs=example_inputs,
-            output_transform=output_transform,
-            unwrapped_parameters=unwrapped_parameters,
-            customized_pruners=customized_pruners,
+            self.model,
+            example_inputs=self.example_inputs,
+            output_transform=self.output_transform,
+            unwrapped_parameters=self.unwrapped_parameters,
+            customized_pruners=self.customized_pruners,
         )
+
 
         self.ignored_layers = []
         if ignored_layers:
@@ -130,7 +135,7 @@ class MetaPruner:
                 initial_total_channels += (self.DG.get_out_channels(
                     group[0][0].target.module) // ch_groups)
             self.initial_total_channels = initial_total_channels
-    
+
     def pruning_history(self):
         return self.DG.pruning_history()
 
@@ -237,6 +242,32 @@ class MetaPruner:
                     module, pruning_fn, pruning_idxs.tolist())
                 if self.DG.check_pruning_group(group):
                     yield group
+
+    def calc_group_importances(self):
+        global_importance = []
+        for group in self.DG.get_all_groups(ignored_layers=self.ignored_layers,
+                                            root_module_types=self.root_module_types):
+            if self._check_sparsity(group):
+                ch_groups = self.get_channel_groups(group)
+                imp = self.estimate_importance(group, ch_groups=ch_groups)
+                if imp is None: continue
+                if ch_groups > 1:
+                    imp = imp[:len(imp) // ch_groups]
+                global_importance.append((group, ch_groups, imp))
+
+        imp = torch.cat([local_imp[-1]
+                         for local_imp in global_importance], dim=0)
+        return imp
+
+    def rebuild_dependency_graph(self, model):
+        self.model = model
+        self.DG = dependency.DependencyGraph().build_dependency(
+            self.model,
+            example_inputs=self.example_inputs,
+            output_transform=self.output_transform,
+            unwrapped_parameters=self.unwrapped_parameters,
+            customized_pruners=self.customized_pruners,
+        )
 
     def prune_global(self):
         if self.current_step > self.iterative_steps:
